@@ -44,6 +44,8 @@ Tax treatment used:
     security, e.g. EM UTTAG/EM INLÄGG): a move, not in the table.
   * UTTAG VP RESULTAT (e.g. a move into an ISK) -> "Förs" at market value (antal x kurs);
     the result is checked against Nordnet's "Resultat".
+  * Every sale's result is checked against Nordnet's "Resultat" when Nordnet has one
+    (non-zero); a difference of more than 1 kr gives a warning.
   * INLÖSEN UTTAG VP (redemption, expired rights) -> "Förs" for the amount in the row; if
     both that amount and the omkostnadsbelopp are 0 (worthless rights received for free)
     the shares are just removed and nothing goes on K4.
@@ -234,6 +236,13 @@ def is_right(t: str, name: str, text: str) -> bool:
                                    or "TECKNINGSR" in u or "UNITR" in u or "RÄTTER" in u)
 
 
+def nordnet_result(r) -> float | None:
+    """Nordnet's realised result for the row; 0 or empty means Nordnet does not know the
+    cost (e.g. shares deposited from elsewhere), so there is nothing to check against."""
+    res = num(r.get("Resultat"))
+    return res if res else None
+
+
 def split_ratio(text: str) -> float | None:
     """'Split ABC B, 4:1' -> 4.0 (new shares per old share)."""
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)", text)
@@ -351,6 +360,7 @@ def process_security(rows: list[dict]) -> Security:
                 fee = num(r.get("Total Avgift")) or 0.0
                 price = num(r.get("Kurs")) or 0.0
                 s.events.append(Event(d, "Förs", q, proceeds=amount, ref=ref,
+                                      nordnet_result=nordnet_result(r),
                                       note=f"Nordnet sålt {q:g} st à {price:g}, avgift {fee:g}"))
         elif "UTTAG" in t and "RESULTAT" in t:
             # Nordnet books a realised result: a disposal at market value, e.g. a move
@@ -358,7 +368,7 @@ def process_security(rows: list[dict]) -> Security:
             price = num(r.get("Kurs")) or 0.0
             s.events.append(Event(d, "Förs", q, proceeds=q * price,
                                   ref=r.get("Notanummer") or r.get("Verifikationsnummer", ""),
-                                  nordnet_result=num(r.get("Resultat")),
+                                  nordnet_result=nordnet_result(r),
                                   note=f"Nordnet {t.lower()} {q:g} st à {price:g} ('{text}'), "
                                        "avyttring till marknadsvärde"))
             warn(f"{s.name} {d}: {t} {q:g} st ('{text}') räknas som avyttring till "
@@ -610,7 +620,8 @@ def compute(events: list[Event], name: str):
                 if e.nordnet_result is not None and \
                         abs(e.nordnet_result - sales[-1]["Resultat"]) > 1:
                     warn(f"{name} {e.date}: resultat {sales[-1]['Resultat']:.2f} kr men "
-                         f"{e.nordnet_result:.2f} kr enligt Nordnet.")
+                         f"{e.nordnet_result:.2f} kr enligt Nordnet (Nordnet räknar med sitt "
+                         "eget anskaffningsvärde) - kontrollera omkostnadsbeloppet.")
         else:
             delta_q, change = e.qty, e.cost
         total_qty += delta_q

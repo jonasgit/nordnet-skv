@@ -357,6 +357,13 @@ func ref(r map[string]string) string {
 	return r["Verifikationsnummer"]
 }
 
+// nordnetResult returns Nordnet's realised result for the row; 0 or empty means Nordnet
+// does not know the cost (e.g. shares deposited from elsewhere), so ok is false.
+func nordnetResult(r map[string]string) (float64, bool) {
+	res, ok := num(r["Resultat"])
+	return res, ok && res != 0
+}
+
 var ratioRe = regexp.MustCompile(`(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)`)
 
 // splitRatio parses "Split ABC B, 4:1" -> 4 (new shares per old share).
@@ -574,14 +581,16 @@ func processSecurity(rows []map[string]string) *Security {
 			} else {
 				fee := numOr0(r["Total Avgift"])
 				price := numOr0(r["Kurs"])
+				res, hasRes := nordnetResult(r)
 				s.Events = append(s.Events, Event{Date: d, Kind: "Förs", Qty: q, Proceeds: amount, Ref: ref(r),
+					NordnetResult: res, HasNordnetResult: hasRes,
 					Note: fmt.Sprintf("Nordnet sålt %s st à %s, avgift %s", g(q), g(price), g(fee))})
 			}
 		case strings.Contains(t, "UTTAG") && strings.Contains(t, "RESULTAT"):
 			// Nordnet books a realised result: a disposal at market value, e.g. a move
 			// into an ISK.
 			price := numOr0(r["Kurs"])
-			res, hasRes := num(r["Resultat"])
+			res, hasRes := nordnetResult(r)
 			s.Events = append(s.Events, Event{Date: d, Kind: "Förs", Qty: q, Proceeds: q * price, Ref: ref(r),
 				NordnetResult: res, HasNordnetResult: hasRes,
 				Note: fmt.Sprintf("Nordnet %s %s st à %s ('%s'), avyttring till marknadsvärde",
@@ -977,7 +986,8 @@ func compute(events []Event, name string) ([]Row, []Sale) {
 					Cost: 0 - change, Result: e.Proceeds + change, Ref: e.Ref}
 				sales = append(sales, sale)
 				if e.HasNordnetResult && math.Abs(e.NordnetResult-sale.Result) > 1 {
-					warn("%s %s: resultat %.2f kr men %.2f kr enligt Nordnet.", name, e.Date, sale.Result, e.NordnetResult)
+					warn("%s %s: resultat %.2f kr men %.2f kr enligt Nordnet (Nordnet räknar med sitt "+
+						"eget anskaffningsvärde) - kontrollera omkostnadsbeloppet.", name, e.Date, sale.Result, e.NordnetResult)
 				}
 			}
 		default:

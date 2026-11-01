@@ -33,7 +33,10 @@ Tax treatment used:
   * SÅLT -> "Förs": utnyttjat omkostnadsbelopp = antal x genomsnitt.
   * SPLIT UTTAG/INLÄGG VP -> "S": quantity x ratio (from the transaction text, checked
     against the quantities), total cost unchanged.
-  * INLÄGG VP and other deposits (OMVANDLING, EMISSION, ...) -> Köp/Förm/Övr with the cost
+  * TECKNING INLÄGG VP (shares subscribed for in a new issue) -> "Köp" at the subscription
+    price; the rights used (TECKNING UT RÄTTER) are removed, and if they had a cost a
+    warning says to add it to the new shares. TECKNING LIKVID (the payment) is ignored.
+  * INLÄGG VP and other deposits (OMVANDLING, BYTE, EMISSION, ...) -> Köp/Förm/Övr with the cost
     from the cost file, else Nordnet's inköpsvärde, else 0 kr with a warning.
   * TILLDELNING INLÄGG of subscription/unit rights (teckningsrätter, uniträtter) -> "Övr"
     with omkostnadsbelopp 0 kr, unless the cost file says otherwise.
@@ -70,7 +73,10 @@ COST_PATTERN = "Omkostnadsbelopp*.csv"
 TEMPLATE = "mall_omkostnadsbelopp.csv"
 COST_KINDS = ("Köp", "Förm", "Övr")
 TRANSFER_DAYS = 7      # max days between UTTAG VP and INLÄGG VP of a move between accounts
-IGNORED = ("UTDELNING", "SKATT", "RÄNTA", "AVGIFT", "KUPONG")  # no effect on the cost
+# No effect on holdings or cost (cash legs such as TECKNING LIKVID included).
+IGNORED = ("UTDELNING", "SKATT", "RÄNTA", "AVGIFT", "KUPONG", "LIKVID")
+# Withdrawals whose cost goes on to another security (swap, conversion, subscription).
+CONVERSIONS = ("OMVANDLING", "BYTE", "TECKNING")
 
 warnings: list[str] = []
 
@@ -148,6 +154,7 @@ class Event:
     note: str = ""
     ref: str = ""
     nordnet_result: float | None = None  # Förs: Nordnet's "Resultat", for a cross-check
+    carry: str = ""    # Ut: CONVERSIONS keyword when the cost goes on to another security
 
     @property
     def order(self) -> int:
@@ -211,18 +218,27 @@ def is_ignored(t: str) -> bool:
     return any(x in t for x in IGNORED)
 
 
+def is_out(t: str) -> bool:
+    """A withdrawal: "... UTTAG ..." or e.g. "TECKNING UT RÄTTER"."""
+    return "UTTAG" in t or bool(re.search(r"\bUT\b", t))
+
+
+def conversion(t: str) -> str:
+    return next((c for c in CONVERSIONS if c in t), "")
+
+
 def delta(t: str, q: float) -> float | None:
     """Holding change of a row; None for an unknown type."""
     if t == "KÖPT":
         return q
     if t == "SÅLT":
         return -q
-    if "INLÄGG" in t:
-        return q
-    if "UTTAG" in t:
-        return -q
     if is_ignored(t):
         return 0.0
+    if "INLÄGG" in t:
+        return q
+    if is_out(t):
+        return -q
     return None
 
 
@@ -377,11 +393,19 @@ def process_security(rows: list[dict]) -> Security:
             s.events.append(Event(d, "Inl", q, proceeds=num(r.get("Belopp")) or 0.0,
                                   ref=r.get("Notanummer") or r.get("Verifikationsnummer", ""),
                                   note=f"Nordnet {t.lower()} {q:g} st ('{text}')"))
+        elif "INLÄGG" in t and "TECKNING" in t:
+            # Shares subscribed for in a new issue: a purchase at the subscription price.
+            cost = num(r.get("Inköpsvärde"))
+            if cost is None:
+                cost = -(num(r.get("Belopp")) or 0.0) or q * (num(r.get("Kurs")) or 0.0)
+            s.events.append(Event(d, "Köp", q, cost,
+                                  ref=r.get("Notanummer") or r.get("Verifikationsnummer", ""),
+                                  note=f"Nordnet teckning {q:g} st ('{text}'), {cost:g} kr"))
         elif "INLÄGG" in t:
             s.deposits.append(Deposit(d, q, text, depa, t, num(r.get("Inköpsvärde")),
                                       num(r.get("Kurs")) or 0.0,
                                       is_right(t, r["Värdepapper"], text)))
-        elif "UTTAG" in t:
+        elif is_out(t):
             withdrawals.append(Deposit(d, q, text, depa, t, None))
 
         hold[depa] += dq
@@ -421,7 +445,7 @@ def process_security(rows: list[dict]) -> Security:
     # Moves: UTTAG VP in one account and INLÄGG VP of the same quantity in another within
     # TRANSFER_DAYS, or in the same account on the same day (Nordnet re-booking).
     for w in withdrawals:
-        if "OMVANDLING" in w.kind:
+        if conversion(w.kind):
             continue
         hit = next((dp for dp in s.deposits if not dp.internal and abs(dp.qty - w.qty) < TOL
                     and (dp.date == w.date if dp.depa == w.depa
@@ -433,10 +457,13 @@ def process_security(rows: list[dict]) -> Security:
     for w in withdrawals:
         if w.internal:
             continue
-        s.events.append(Event(w.date, "Ut", w.qty,
-                              note=f"Nordnet {w.kind.lower()} {w.qty:g} st ('{w.text}'), "
-                                   "tas bort till genomsnittligt omkostnadsbelopp"))
-        if "OMVANDLING" not in w.kind:
+        carry = conversion(w.kind)
+        what = ("utnyttjade vid teckning" if carry == "TECKNING" else
+                "bytta mot andra värdepapper" if carry else
+                "tas bort till genomsnittligt omkostnadsbelopp")
+        s.events.append(Event(w.date, "Ut", w.qty, carry=carry,
+                              note=f"Nordnet {w.kind.lower()} {w.qty:g} st ('{w.text}'), {what}"))
+        if not carry:
             warn(f"{s.name} {w.date}: {w.kind} {w.qty:g} st ('{w.text}') - aktierna flyttades "
                  "från Nordnet och tas bort till genomsnittligt omkostnadsbelopp. Säljs de "
                  "någon annanstans gäller samma genomsnitt.")
@@ -604,6 +631,9 @@ def compute(events: list[Event], name: str):
                      "ofullständig.")
             avg_before = total_cost / total_qty if total_qty else 0.0
             delta_q, change = -e.qty, -e.qty * avg_before + 0.0  # avoid -0.0
+            if kind == "Ut" and e.carry == "TECKNING" and abs(change) >= 0.005:
+                warn(f"{name} {e.date}: omkostnadsbelopp {-change:.2f} kr för de utnyttjade "
+                     "rätterna ska läggas till de tecknade aktiernas - ange det i kostnadsfilen.")
             if kind == "Inl":
                 if abs(e.proceeds) < 0.005 and abs(change) < 0.005:
                     kind, note = "Ut", note + ", utan ersättning och utan omkostnadsbelopp"
@@ -683,6 +713,11 @@ def build_log(s: Security, rows: list[dict], sales: list[dict]) -> list[dict]:
 
 def fmt_sv(v, decimals: int) -> str:
     return f"{v:,.{decimals}f}".replace(",", " ").replace(".", ",")
+
+
+def fmt_qty(v: float) -> str:
+    """Whole shares without decimals, fractions (e.g. fund units) with 4."""
+    return fmt_sv(v, 0 if abs(v - round(v)) < 1e-9 else 4)
 
 
 def fmt_plain(v: float) -> str:
@@ -811,7 +846,7 @@ def main() -> None:
                                 "Omkostnadsbelopp": s["Omkostnadsbelopp"],
                                 "Vinst": max(res, 0.0), "Förlust": max(-res, 0.0),
                                 "Nota": s["Nota"]})
-                data.append([y, s["Datum"], s["Beteckning"], fmt_sv(s["Antal"], 0),
+                data.append([y, s["Datum"], s["Beteckning"], fmt_qty(s["Antal"]),
                              fmt_sv(s["Försäljningspris"], 0), fmt_sv(s["Omkostnadsbelopp"], 0),
                              fmt_sv(max(res, 0), 0), fmt_sv(max(-res, 0), 0)])
             tp = sum(s["Försäljningspris"] for s in ys)

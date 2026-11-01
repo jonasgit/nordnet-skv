@@ -42,8 +42,26 @@ const (
 	transferDays = 7 // max days between UTTAG VP and INLÄGG VP of a move between accounts
 )
 
-// Transaction types containing any of these do not affect the omkostnadsbelopp.
-var ignored = []string{"UTDELNING", "SKATT", "RÄNTA", "AVGIFT", "KUPONG"}
+// Transaction types containing any of these affect neither holdings nor cost (cash legs
+// such as TECKNING LIKVID included).
+var ignored = []string{"UTDELNING", "SKATT", "RÄNTA", "AVGIFT", "KUPONG", "LIKVID"}
+
+// Withdrawals whose cost goes on to another security (swap, conversion, subscription).
+var conversions = []string{"OMVANDLING", "BYTE", "TECKNING"}
+
+var outRe = regexp.MustCompile(`\bUT\b`)
+
+// isOut reports a withdrawal: "... UTTAG ..." or e.g. "TECKNING UT RÄTTER".
+func isOut(t string) bool { return strings.Contains(t, "UTTAG") || outRe.MatchString(t) }
+
+func conversion(t string) string {
+	for _, c := range conversions {
+		if strings.Contains(t, c) {
+			return c
+		}
+	}
+	return ""
+}
 
 var warnings []string
 
@@ -93,6 +111,14 @@ func numOr0(s string) float64 { f, _ := num(s); return f }
 
 // g formats like Python's "{:g}".
 func g(f float64) string { return strconv.FormatFloat(f, 'g', 6, 64) }
+
+// fmtQty shows whole shares without decimals, fractions (e.g. fund units) with 4.
+func fmtQty(v float64) string {
+	if math.Abs(v-math.Round(v)) < 1e-9 {
+		return fmtSv(v, 0)
+	}
+	return fmtSv(v, 4)
+}
 
 func fmtPlain(f float64) string { return strings.ReplaceAll(g(f), ".", ",") }
 
@@ -237,6 +263,7 @@ type Event struct {
 	// Förs: Nordnet's "Resultat", for a cross-check
 	NordnetResult    float64
 	HasNordnetResult bool
+	Carry            string // Ut: conversions keyword when the cost goes on to another security
 }
 
 func (e Event) Order() int { return order[e.Kind] }
@@ -326,12 +353,12 @@ func delta(t string, q float64) (float64, bool) {
 		return q, true
 	case t == "SÅLT":
 		return -q, true
-	case strings.Contains(t, "INLÄGG"):
-		return q, true
-	case strings.Contains(t, "UTTAG"):
-		return -q, true
 	case isIgnored(t):
 		return 0, true
+	case strings.Contains(t, "INLÄGG"):
+		return q, true
+	case isOut(t):
+		return -q, true
 	}
 	return 0, false
 }
@@ -600,12 +627,22 @@ func processSecurity(rows []map[string]string) *Security {
 		case strings.Contains(t, "UTTAG") && strings.Contains(t, "INLÖSEN"):
 			s.Events = append(s.Events, Event{Date: d, Kind: "Inl", Qty: q, Proceeds: numOr0(r["Belopp"]),
 				Ref: ref(r), Note: fmt.Sprintf("Nordnet %s %s st ('%s')", strings.ToLower(t), g(q), text)})
+		case strings.Contains(t, "INLÄGG") && strings.Contains(t, "TECKNING"):
+			// Shares subscribed for in a new issue: a purchase at the subscription price.
+			cost, ok := num(r["Inköpsvärde"])
+			if !ok {
+				if cost = -numOr0(r["Belopp"]); cost == 0 {
+					cost = q * numOr0(r["Kurs"])
+				}
+			}
+			s.Events = append(s.Events, Event{Date: d, Kind: "Köp", Qty: q, Cost: cost, Ref: ref(r),
+				Note: fmt.Sprintf("Nordnet teckning %s st ('%s'), %s kr", g(q), text, g(cost))})
 		case strings.Contains(t, "INLÄGG"):
 			c, has := num(r["Inköpsvärde"])
 			s.Deposits = append(s.Deposits, &Deposit{Date: d, Qty: q, Text: text, Depa: depa, Kind: t,
 				NordnetCost: c, HasCost: has, Price: numOr0(r["Kurs"]),
 				Right: isRight(t, r["Värdepapper"], text)})
-		case strings.Contains(t, "UTTAG"):
+		case isOut(t):
 			withdrawals = append(withdrawals, &Deposit{Date: d, Qty: q, Text: text, Depa: depa, Kind: t})
 		}
 
@@ -661,7 +698,7 @@ func processSecurity(rows []map[string]string) *Security {
 	// Moves: UTTAG VP in one account and INLÄGG VP of the same quantity in another within
 	// transferDays, or in the same account on the same day (Nordnet re-booking).
 	for _, w := range withdrawals {
-		if strings.Contains(w.Kind, "OMVANDLING") {
+		if conversion(w.Kind) != "" {
 			continue
 		}
 		for _, dp := range s.Deposits {
@@ -685,10 +722,17 @@ func processSecurity(rows []map[string]string) *Security {
 		if w.Internal {
 			continue
 		}
-		s.Events = append(s.Events, Event{Date: w.Date, Kind: "Ut", Qty: w.Qty,
-			Note: fmt.Sprintf("Nordnet %s %s st ('%s'), tas bort till genomsnittligt omkostnadsbelopp",
-				strings.ToLower(w.Kind), g(w.Qty), w.Text)})
-		if !strings.Contains(w.Kind, "OMVANDLING") {
+		carry := conversion(w.Kind)
+		what := "tas bort till genomsnittligt omkostnadsbelopp"
+		switch {
+		case carry == "TECKNING":
+			what = "utnyttjade vid teckning"
+		case carry != "":
+			what = "bytta mot andra värdepapper"
+		}
+		s.Events = append(s.Events, Event{Date: w.Date, Kind: "Ut", Qty: w.Qty, Carry: carry,
+			Note: fmt.Sprintf("Nordnet %s %s st ('%s'), %s", strings.ToLower(w.Kind), g(w.Qty), w.Text, what)})
+		if carry == "" {
 			warn("%s %s: %s %s st ('%s') - aktierna flyttades från Nordnet och tas bort till "+
 				"genomsnittligt omkostnadsbelopp. Säljs de någon annanstans gäller samma genomsnitt.",
 				s.Name, w.Date, w.Kind, g(w.Qty), w.Text)
@@ -970,6 +1014,10 @@ func compute(events []Event, name string) ([]Row, []Sale) {
 				avgBefore = totalCost / totalQty
 			}
 			dq, change = -e.Qty, -e.Qty*avgBefore+0 // +0 avoids -0
+			if kind == "Ut" && e.Carry == "TECKNING" && math.Abs(change) >= 0.005 {
+				warn("%s %s: omkostnadsbelopp %.2f kr för de utnyttjade rätterna ska läggas till de "+
+					"tecknade aktiernas - ange det i kostnadsfilen.", name, e.Date, -change)
+			}
 			if kind == "Inl" {
 				if math.Abs(e.Proceeds) < 0.005 && math.Abs(change) < 0.005 {
 					kind, note = "Ut", note+", utan ersättning och utan omkostnadsbelopp"
@@ -1309,7 +1357,7 @@ func main() {
 				}
 				k4 = append(k4, []string{y, s.Date.String(), nf.f(s.Qty, 5), s.Name, nf.f(s.Proceeds, 0),
 					nf.f(s.Cost, 0), nf.f(pos(s.Result), 0), nf.f(pos(-s.Result), 0), s.Ref})
-				disp = append(disp, []string{y, s.Date.String(), s.Name, fmtSv(s.Qty, 0), fmtSv(s.Proceeds, 0),
+				disp = append(disp, []string{y, s.Date.String(), s.Name, fmtQty(s.Qty), fmtSv(s.Proceeds, 0),
 					fmtSv(s.Cost, 0), fmtSv(pos(s.Result), 0), fmtSv(pos(-s.Result), 0)})
 				tp += s.Proceeds
 				to += s.Cost

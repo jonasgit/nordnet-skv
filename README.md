@@ -20,6 +20,13 @@ Särskilda transaktioner:
   K4. Resultatet stäms av mot Nordnets kolumn Resultat.
 - Flytt från ISK (INLÄGG med ISK i texten) får marknadsvärdet på överföringsdagen som
   omkostnadsbelopp. Nordnet anger det sällan, så ange det i kostnadsfilen.
+- Nyemission: tecknade aktier/BTA (TECKNING INLÄGG VP) blir Köp till teckningskursen. De
+  utnyttjade rätterna (TECKNING UT RÄTTER) tas bort, och har de ett omkostnadsbelopp (köpta
+  rätter) varnar programmet att det ska läggas till de nya aktierna. Betalningsraden
+  (TECKNING LIKVID) påverkar inte beräkningen. Byte av BTA till aktier (BYTE UTTAG/INLÄGG)
+  flyttar omkostnadsbeloppet enligt Nordnets inköpsvärde.
+- Fondandelar hanteras som aktier, med decimaler. Aktie- och blandfonder redovisas på K4
+  avsnitt A, rena räntefonder på avsnitt C - flytta sådana rader själv.
 - Nordnets ombokningar inom samma depå samma dag (t.ex. EM UTTAG + EM INLÄGG) påverkar inte
   beräkningen.
 

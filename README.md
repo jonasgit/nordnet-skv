@@ -39,9 +39,9 @@ oftast inget omkostnadsbelopp i Nordnets export. Ange det i en egen fil:
 Omkostnadsbelopp.csv
 
     Värdepapper;Datum;Antal;Omkostnadsbelopp;Händelse;Kommentar
-    VOLVO B;2024-05-27;262;52400;Köp;
-    SE0000115446;2024-10-24;150;30000;Köp;köpta aktier
-    SE0000115446;2024-10-24;50;12500;Förm;förmånsbeskattade aktier
+    EXEMPEL AB B;2024-05-27;262;52400;Köp;
+    SE0000000000;2024-10-24;150;30000;Köp;köpta aktier
+    SE0000000000;2024-10-24;50;12500;Förm;förmånsbeskattade aktier
 
 - Värdepapper är namnet eller ISIN som i Nordnet-exporten.
 - Datum (ÅÅÅÅ-MM-DD) och Antal ska stämma med inlägget i Nordnet. Flera rader samma datum

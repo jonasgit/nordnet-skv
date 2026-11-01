@@ -221,8 +221,9 @@ func find(dir, pattern string) []string {
 
 // ---------------------------------------------------------------------------- model
 
-// Event kinds: Köp, Förm, Övr, S, Förs, Ut (withdrawal at average cost, shown as Övr).
-var order = map[string]int{"S": 0, "Köp": 1, "Förm": 2, "Övr": 2, "Ut": 3, "Förs": 3}
+// Event kinds: Köp, Förm, Övr, S, Förs, Ut (withdrawal at average cost, shown as Övr),
+// Inl (redemption: a sale, or just a removal if there is neither payment nor cost).
+var order = map[string]int{"S": 0, "Köp": 1, "Förm": 2, "Övr": 2, "Ut": 3, "Inl": 3, "Förs": 3}
 
 type Event struct {
 	Date     Date
@@ -233,6 +234,9 @@ type Event struct {
 	Ratio    float64 // S: new shares per old share
 	Note     string
 	Ref      string
+	// Förs: Nordnet's "Resultat", for a cross-check
+	NordnetResult    float64
+	HasNordnetResult bool
 }
 
 func (e Event) Order() int { return order[e.Kind] }
@@ -254,7 +258,9 @@ type Deposit struct {
 	Kind        string // Nordnet transaktionstyp
 	NordnetCost float64
 	HasCost     bool
-	Internal    bool // move between own accounts
+	Price       float64 // "Kurs" in the row
+	Right       bool    // allotted subscription/unit right
+	Internal    bool    // move between own accounts
 }
 
 type Security struct {
@@ -328,6 +334,27 @@ func delta(t string, q float64) (float64, bool) {
 		return 0, true
 	}
 	return 0, false
+}
+
+var rightNameRe = regexp.MustCompile(`\b(B?TR|UR|TECKNINGSR\S*|UNITR\S*)$`)
+
+// isRight reports an allotted subscription or unit right (teckningsrätt/uniträtt).
+func isRight(t, name, text string) bool {
+	u := strings.ToUpper(text)
+	return strings.Contains(t, "TILLDELNING") &&
+		(rightNameRe.MatchString(strings.TrimSpace(strings.ToUpper(name))) ||
+			strings.Contains(u, "TECKNINGSR") || strings.Contains(u, "UNITR") || strings.Contains(u, "RÄTTER"))
+}
+
+var iskRe = regexp.MustCompile(`\bISK\b`)
+
+func fromISK(dp *Deposit) bool { return iskRe.MatchString(strings.ToUpper(dp.Text)) }
+
+func ref(r map[string]string) string {
+	if r["Notanummer"] != "" {
+		return r["Notanummer"]
+	}
+	return r["Verifikationsnummer"]
 }
 
 var ratioRe = regexp.MustCompile(`(\d+(?:[.,]\d+)?)\s*:\s*(\d+(?:[.,]\d+)?)`)
@@ -541,20 +568,34 @@ func processSecurity(rows []map[string]string) *Security {
 				currencies[cur] = true
 			}
 			amount := numOr0(r["Belopp"])
-			ref := r["Notanummer"]
 			if t == "KÖPT" {
 				s.Events = append(s.Events, Event{Date: d, Kind: "Köp", Qty: q, Cost: -amount,
-					Note: fmt.Sprintf("Nordnet köpt %s st", g(q)), Ref: ref})
+					Note: fmt.Sprintf("Nordnet köpt %s st", g(q)), Ref: ref(r)})
 			} else {
 				fee := numOr0(r["Total Avgift"])
 				price := numOr0(r["Kurs"])
-				s.Events = append(s.Events, Event{Date: d, Kind: "Förs", Qty: q, Proceeds: amount, Ref: ref,
+				s.Events = append(s.Events, Event{Date: d, Kind: "Förs", Qty: q, Proceeds: amount, Ref: ref(r),
 					Note: fmt.Sprintf("Nordnet sålt %s st à %s, avgift %s", g(q), g(price), g(fee))})
 			}
+		case strings.Contains(t, "UTTAG") && strings.Contains(t, "RESULTAT"):
+			// Nordnet books a realised result: a disposal at market value, e.g. a move
+			// into an ISK.
+			price := numOr0(r["Kurs"])
+			res, hasRes := num(r["Resultat"])
+			s.Events = append(s.Events, Event{Date: d, Kind: "Förs", Qty: q, Proceeds: q * price, Ref: ref(r),
+				NordnetResult: res, HasNordnetResult: hasRes,
+				Note: fmt.Sprintf("Nordnet %s %s st à %s ('%s'), avyttring till marknadsvärde",
+					strings.ToLower(t), g(q), g(price), text)})
+			warn("%s %s: %s %s st ('%s') räknas som avyttring till marknadsvärde (%s x %s kr), "+
+				"t.ex. flytt till ISK - kontrollera.", s.Name, d, t, g(q), text, g(q), g(price))
+		case strings.Contains(t, "UTTAG") && strings.Contains(t, "INLÖSEN"):
+			s.Events = append(s.Events, Event{Date: d, Kind: "Inl", Qty: q, Proceeds: numOr0(r["Belopp"]),
+				Ref: ref(r), Note: fmt.Sprintf("Nordnet %s %s st ('%s')", strings.ToLower(t), g(q), text)})
 		case strings.Contains(t, "INLÄGG"):
 			c, has := num(r["Inköpsvärde"])
 			s.Deposits = append(s.Deposits, &Deposit{Date: d, Qty: q, Text: text, Depa: depa, Kind: t,
-				NordnetCost: c, HasCost: has})
+				NordnetCost: c, HasCost: has, Price: numOr0(r["Kurs"]),
+				Right: isRight(t, r["Värdepapper"], text)})
 		case strings.Contains(t, "UTTAG"):
 			withdrawals = append(withdrawals, &Deposit{Date: d, Qty: q, Text: text, Depa: depa, Kind: t})
 		}
@@ -608,16 +649,19 @@ func processSecurity(rows []map[string]string) *Security {
 		s.Events = append(s.Events, Event{Date: d, Kind: "S", Ratio: ratio, Note: "Split " + label})
 	}
 
-	// Moves between own accounts: UTTAG VP in one account, INLÄGG VP of the same quantity
-	// in another within transferDays.
+	// Moves: UTTAG VP in one account and INLÄGG VP of the same quantity in another within
+	// transferDays, or in the same account on the same day (Nordnet re-booking).
 	for _, w := range withdrawals {
 		if strings.Contains(w.Kind, "OMVANDLING") {
 			continue
 		}
 		for _, dp := range s.Deposits {
 			days := w.Date.DaysTo(dp.Date)
-			if !dp.Internal && dp.Depa != w.Depa && math.Abs(dp.Qty-w.Qty) < tol &&
-				days <= transferDays && days >= -transferDays {
+			near := days <= transferDays && days >= -transferDays
+			if dp.Depa == w.Depa {
+				near = days == 0
+			}
+			if !dp.Internal && math.Abs(dp.Qty-w.Qty) < tol && near {
 				w.Internal, dp.Internal = true, true
 				a, b := w.Date, dp.Date
 				if b.Before(a) {
@@ -767,16 +811,34 @@ func depositEvents(s *Security, costs []*CostRow, haveFile bool) []Event {
 		rows := byDate[d]
 		got := fromRows(rows, prefix)
 		rest := qty - got
+		iskMissing := false
 		if rest > tol && len(rows) == 0 {
-			// No cost file rows: use Nordnet's inköpsvärde where it has one.
+			// No cost file rows: rights get 0 kr, otherwise Nordnet's inköpsvärde, or the
+			// market value for shares taken out of an ISK.
 			for _, x := range items {
-				if x.HasCost {
+				switch {
+				case x.Right:
+					events = append(events, Event{Date: d, Kind: "Övr", Qty: x.Qty,
+						Note: prefix + ", tilldelade rätter, omkostnadsbelopp 0 kr"})
+				case x.HasCost:
 					events = append(events, Event{Date: d, Kind: "Övr", Qty: x.Qty, Cost: x.NordnetCost,
 						Note: fmt.Sprintf("%s, inköpsvärde %s enligt Nordnet", prefix, g(x.NordnetCost))})
 					warn("%s %s: %s %s st medtagen med inköpsvärde %s kr enligt Nordnet - kontrollera.",
 						s.Name, d, x.Kind, g(x.Qty), g(x.NordnetCost))
-					rest -= x.Qty
+				case fromISK(x) && x.Price != 0:
+					events = append(events, Event{Date: d, Kind: "Övr", Qty: x.Qty, Cost: x.Qty * x.Price,
+						Note: fmt.Sprintf("%s, marknadsvärde %s x %s", prefix, g(x.Qty), g(x.Price))})
+					warn("%s %s: %s st från ISK medtagna till marknadsvärde %s x %s kr - kontrollera.",
+						s.Name, d, g(x.Qty), g(x.Qty), g(x.Price))
+				default:
+					if fromISK(x) {
+						iskMissing = true
+						warn("%s %s: %s st flyttade från ISK ('%s') - omkostnadsbeloppet är "+
+							"marknadsvärdet på överföringsdagen, ange det i kostnadsfilen.", s.Name, d, g(x.Qty), x.Text)
+					}
+					continue
 				}
+				rest -= x.Qty
 			}
 		}
 		if rest > tol {
@@ -785,7 +847,7 @@ func depositEvents(s *Security, costs []*CostRow, haveFile bool) []Event {
 			if len(rows) > 0 {
 				warn("%s %s: inlägg %s st men kostnadsfilen har %s st - %s st tas med till 0 kr.",
 					s.Name, d, g(qty), g(got), g(rest))
-			} else {
+			} else if !iskMissing {
 				missingDates = append(missingDates, d.String())
 			}
 		} else if got-qty > tol {
@@ -829,7 +891,7 @@ func writeTemplate(path string, secs []*Security) {
 		}
 		var deps []*Deposit
 		for _, dp := range s.Deposits {
-			if !dp.Internal {
+			if !dp.Internal && !dp.Right {
 				deps = append(deps, dp)
 			}
 		}
@@ -839,7 +901,11 @@ func writeTemplate(path string, secs []*Security) {
 			if dp.HasCost {
 				cost, kind = fmtPlain(dp.NordnetCost), "Övr"
 			}
-			rows = append(rows, []string{s.Name, dp.Date.String(), fmtPlain(dp.Qty), cost, kind, ""})
+			note := ""
+			if fromISK(dp) {
+				note = "Marknadsvärde på överföringsdagen (från ISK)"
+			}
+			rows = append(rows, []string{s.Name, dp.Date.String(), fmtPlain(dp.Qty), cost, kind, note})
 		}
 	}
 	writeCSV(path, []string{"Värdepapper", "Datum", "Antal", "Omkostnadsbelopp", "Händelse", "Kommentar"}, rows, true)
@@ -877,14 +943,15 @@ func compute(events []Event, name string) ([]Row, []Sale) {
 	totalQty, totalCost := 0.0, 0.0
 	for _, e := range ev {
 		var dq, change float64
-		switch e.Kind {
+		kind, note := e.Kind, e.Note
+		switch kind {
 		case "S":
 			dq = totalQty * (e.Ratio - 1)
-		case "Förs", "Ut":
+		case "Förs", "Ut", "Inl":
 			if e.Qty > totalQty+tol {
-				what := "uttag"
-				if e.Kind == "Förs" {
-					what = "försäljning"
+				what := "försäljning"
+				if kind == "Ut" {
+					what = "uttag"
 				}
 				warn("%s %s: %s av %s st men endast %s st i beräkningen - historiken är ofullständig.",
 					name, e.Date, what, g(e.Qty), g(totalQty))
@@ -894,9 +961,24 @@ func compute(events []Event, name string) ([]Row, []Sale) {
 				avgBefore = totalCost / totalQty
 			}
 			dq, change = -e.Qty, -e.Qty*avgBefore+0 // +0 avoids -0
-			if e.Kind == "Förs" {
-				sales = append(sales, Sale{Date: e.Date, Qty: e.Qty, Name: name, Proceeds: e.Proceeds,
-					Cost: 0 - change, Result: e.Proceeds + change, Ref: e.Ref})
+			if kind == "Inl" {
+				if math.Abs(e.Proceeds) < 0.005 && math.Abs(change) < 0.005 {
+					kind, note = "Ut", note+", utan ersättning och utan omkostnadsbelopp"
+				} else {
+					kind = "Förs"
+					if math.Abs(e.Proceeds) < 0.005 {
+						warn("%s %s: inlösen/förfall av %s st utan belopp redovisas som försäljning "+
+							"för 0 kr - kontrollera om likvid bokats på en egen rad.", name, e.Date, g(e.Qty))
+					}
+				}
+			}
+			if kind == "Förs" {
+				sale := Sale{Date: e.Date, Qty: e.Qty, Name: name, Proceeds: e.Proceeds,
+					Cost: 0 - change, Result: e.Proceeds + change, Ref: e.Ref}
+				sales = append(sales, sale)
+				if e.HasNordnetResult && math.Abs(e.NordnetResult-sale.Result) > 1 {
+					warn("%s %s: resultat %.2f kr men %.2f kr enligt Nordnet.", name, e.Date, sale.Result, e.NordnetResult)
+				}
 			}
 		default:
 			dq, change = e.Qty, e.Cost
@@ -910,11 +992,10 @@ func compute(events []Event, name string) ([]Row, []Sale) {
 		if totalQty != 0 {
 			avg = totalCost / totalQty
 		}
-		kind := e.Kind
 		if kind == "Ut" {
 			kind = "Övr"
 		}
-		rows = append(rows, Row{name, e.Date, kind, dq, totalQty, change, totalCost, avg, e.Note})
+		rows = append(rows, Row{name, e.Date, kind, dq, totalQty, change, totalCost, avg, note})
 	}
 	return rows, sales
 }

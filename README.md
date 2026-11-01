@@ -10,6 +10,19 @@ så historiken följer med när ett ISIN byts (t.ex. vid split). Splitar läses 
 SPLIT-rader. Flyttar mellan egna depåer (UTTAG VP + INLÄGG VP med samma antal inom en
 vecka) räknas inte som förvärv eller avyttring.
 
+Särskilda transaktioner:
+
+- Tilldelade teckningsrätter/uniträtter (TILLDELNING INLÄGG) får omkostnadsbelopp 0 kr.
+- Förfallna rätter (INLÖSEN UTTAG VP utan belopp och utan omkostnadsbelopp) tas bort utan
+  K4-rad. Har de ett omkostnadsbelopp, t.ex. köpta rätter, redovisas de som försäljning för
+  0 kr.
+- Flytt till ISK (UTTAG VP RESULTAT) är en avyttring till marknadsvärde och kommer med på
+  K4. Resultatet stäms av mot Nordnets kolumn Resultat.
+- Flytt från ISK (INLÄGG med ISK i texten) får marknadsvärdet på överföringsdagen som
+  omkostnadsbelopp. Nordnet anger det sällan, så ange det i kostnadsfilen.
+- Nordnets ombokningar inom samma depå samma dag (t.ex. EM UTTAG + EM INLÄGG) påverkar inte
+  beräkningen.
+
 ISK och kapitalförsäkring deklareras inte på K4. Ta bara med vanliga depåer:
 
     python3 nordnet_skv.py --depa 1234567

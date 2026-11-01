@@ -35,8 +35,18 @@ Tax treatment used:
     against the quantities), total cost unchanged.
   * INLÄGG VP and other deposits (OMVANDLING, EMISSION, ...) -> Köp/Förm/Övr with the cost
     from the cost file, else Nordnet's inköpsvärde, else 0 kr with a warning.
+  * TILLDELNING INLÄGG of subscription/unit rights (teckningsrätter, uniträtter) -> "Övr"
+    with omkostnadsbelopp 0 kr, unless the cost file says otherwise.
+  * INLÄGG VP from an ISK (text mentions ISK) -> cost = market value on the day: the price
+    in the row if Nordnet gives one, otherwise from the cost file (warning).
   * UTTAG VP matched by an INLÄGG VP of the same quantity in another of your Nordnet
-    accounts within a week: a move between own accounts, not in the table.
+    accounts within a week, or in the same account on the same day (Nordnet re-booking a
+    security, e.g. EM UTTAG/EM INLÄGG): a move, not in the table.
+  * UTTAG VP RESULTAT (e.g. a move into an ISK) -> "Förs" at market value (antal x kurs);
+    the result is checked against Nordnet's "Resultat".
+  * INLÖSEN UTTAG VP (redemption, expired rights) -> "Förs" for the amount in the row; if
+    both that amount and the omkostnadsbelopp are 0 (worthless rights received for free)
+    the shares are just removed and nothing goes on K4.
   * Other withdrawals (OMVANDLING UTTAG, UTTAG VP to another custodian, ...) -> "Övr" that
     removes the shares at the average cost, with a warning.
   * Dividends, taxes and fees do not change the omkostnadsbelopp.
@@ -120,19 +130,22 @@ def find(directory: str, pattern: str) -> list[str]:
 # --------------------------------------------------------------------------- model
 
 # Order of events on the same date.
-ORDER = {"S": 0, "Köp": 1, "Förm": 2, "Övr": 2, "Ut": 3, "Förs": 3}
+ORDER = {"S": 0, "Köp": 1, "Förm": 2, "Övr": 2, "Ut": 3, "Inl": 3, "Förs": 3}
 
 
 @dataclass
 class Event:
     date: dt.date
-    kind: str          # Köp, Förm, Övr, S, Förs, Ut (withdrawal at average cost, shown as Övr)
-    qty: float = 0.0   # shares in (+); for Förs/Ut the number of shares out (positive)
+    # Köp, Förm, Övr, S, Förs, Ut (withdrawal at average cost, shown as Övr),
+    # Inl (redemption: a sale, or just a removal if there is neither payment nor cost)
+    kind: str
+    qty: float = 0.0   # shares in (+); for Förs/Ut/Inl the number of shares out (positive)
     cost: float = 0.0  # added omkostnadsbelopp (Köp/Förm/Övr)
-    proceeds: float = 0.0  # Förs: net sale amount after fees
+    proceeds: float = 0.0  # Förs/Inl: net sale amount after fees
     ratio: float = 1.0     # S: new shares per old share
     note: str = ""
     ref: str = ""
+    nordnet_result: float | None = None  # Förs: Nordnet's "Resultat", for a cross-check
 
     @property
     def order(self) -> int:
@@ -147,6 +160,8 @@ class Deposit:
     depa: str
     kind: str                 # Nordnet transaktionstyp
     nordnet_cost: float | None
+    price: float = 0.0        # "Kurs" in the row
+    right: bool = False       # allotted subscription/unit right
     internal: bool = False    # move between own accounts
 
 
@@ -207,6 +222,16 @@ def delta(t: str, q: float) -> float | None:
     if is_ignored(t):
         return 0.0
     return None
+
+
+RIGHT_NAME = re.compile(r"\b(B?TR|UR|TECKNINGSR\S*|UNITR\S*)$")
+
+
+def is_right(t: str, name: str, text: str) -> bool:
+    """An allotted subscription or unit right (teckningsrätt/uniträtt)."""
+    u = text.upper()
+    return "TILLDELNING" in t and (bool(RIGHT_NAME.search(name.upper().strip()))
+                                   or "TECKNINGSR" in u or "UNITR" in u or "RÄTTER" in u)
 
 
 def split_ratio(text: str) -> float | None:
@@ -319,7 +344,7 @@ def process_security(rows: list[dict]) -> Security:
             if cur:
                 currencies.add(cur)
             amount = num(r.get("Belopp")) or 0.0
-            ref = r.get("Notanummer", "")
+            ref = r.get("Notanummer") or r.get("Verifikationsnummer", "")
             if t == "KÖPT":
                 s.events.append(Event(d, "Köp", q, -amount, note=f"Nordnet köpt {q:g} st", ref=ref))
             else:
@@ -327,8 +352,25 @@ def process_security(rows: list[dict]) -> Security:
                 price = num(r.get("Kurs")) or 0.0
                 s.events.append(Event(d, "Förs", q, proceeds=amount, ref=ref,
                                       note=f"Nordnet sålt {q:g} st à {price:g}, avgift {fee:g}"))
+        elif "UTTAG" in t and "RESULTAT" in t:
+            # Nordnet books a realised result: a disposal at market value, e.g. a move
+            # into an ISK.
+            price = num(r.get("Kurs")) or 0.0
+            s.events.append(Event(d, "Förs", q, proceeds=q * price,
+                                  ref=r.get("Notanummer") or r.get("Verifikationsnummer", ""),
+                                  nordnet_result=num(r.get("Resultat")),
+                                  note=f"Nordnet {t.lower()} {q:g} st à {price:g} ('{text}'), "
+                                       "avyttring till marknadsvärde"))
+            warn(f"{s.name} {d}: {t} {q:g} st ('{text}') räknas som avyttring till "
+                 f"marknadsvärde ({q:g} x {price:g} kr), t.ex. flytt till ISK - kontrollera.")
+        elif "UTTAG" in t and "INLÖSEN" in t:
+            s.events.append(Event(d, "Inl", q, proceeds=num(r.get("Belopp")) or 0.0,
+                                  ref=r.get("Notanummer") or r.get("Verifikationsnummer", ""),
+                                  note=f"Nordnet {t.lower()} {q:g} st ('{text}')"))
         elif "INLÄGG" in t:
-            s.deposits.append(Deposit(d, q, text, depa, t, num(r.get("Inköpsvärde"))))
+            s.deposits.append(Deposit(d, q, text, depa, t, num(r.get("Inköpsvärde")),
+                                      num(r.get("Kurs")) or 0.0,
+                                      is_right(t, r["Värdepapper"], text)))
         elif "UTTAG" in t:
             withdrawals.append(Deposit(d, q, text, depa, t, None))
 
@@ -366,13 +408,14 @@ def process_security(rows: list[dict]) -> Security:
         label = f"{ratio:g}:1" if ratio >= 1 else f"1:{1 / ratio:g}"
         s.events.append(Event(d, "S", ratio=ratio, note=f"Split {label}"))
 
-    # Moves between own accounts: UTTAG VP in one account, INLÄGG VP of the same quantity
-    # in another within TRANSFER_DAYS.
+    # Moves: UTTAG VP in one account and INLÄGG VP of the same quantity in another within
+    # TRANSFER_DAYS, or in the same account on the same day (Nordnet re-booking).
     for w in withdrawals:
         if "OMVANDLING" in w.kind:
             continue
-        hit = next((dp for dp in s.deposits if not dp.internal and dp.depa != w.depa
-                    and abs(dp.qty - w.qty) < TOL and abs((dp.date - w.date).days) <= TRANSFER_DAYS),
+        hit = next((dp for dp in s.deposits if not dp.internal and abs(dp.qty - w.qty) < TOL
+                    and (dp.date == w.date if dp.depa == w.depa
+                         else abs((dp.date - w.date).days) <= TRANSFER_DAYS)),
                    None)
         if hit:
             w.internal = hit.internal = True
@@ -463,21 +506,38 @@ def deposit_events(s: Security, costs: list[CostRow], have_file: bool) -> list[E
         rows = by_date.get(d, [])
         got = from_rows(rows, prefix)
         rest = qty - got
+        isk_missing = False
         if rest > TOL and not rows:
-            # No cost file rows: use Nordnet's inköpsvärde where it has one.
+            # No cost file rows: rights get 0 kr, otherwise Nordnet's inköpsvärde, or the
+            # market value for shares taken out of an ISK.
             for x in items:
-                if x.nordnet_cost is not None:
+                if x.right:
+                    events.append(Event(d, "Övr", x.qty, 0.0,
+                                        note=f"{prefix}, tilldelade rätter, omkostnadsbelopp 0 kr"))
+                elif x.nordnet_cost is not None:
                     events.append(Event(d, "Övr", x.qty, x.nordnet_cost,
                                         note=f"{prefix}, inköpsvärde {x.nordnet_cost:g} enligt Nordnet"))
                     warn(f"{s.name} {d}: {x.kind} {x.qty:g} st medtagen med inköpsvärde "
                          f"{x.nordnet_cost:g} kr enligt Nordnet - kontrollera.")
-                    rest -= x.qty
+                elif from_isk(x) and x.price:
+                    events.append(Event(d, "Övr", x.qty, x.qty * x.price,
+                                        note=f"{prefix}, marknadsvärde {x.qty:g} x {x.price:g}"))
+                    warn(f"{s.name} {d}: {x.qty:g} st från ISK medtagna till marknadsvärde "
+                         f"{x.qty:g} x {x.price:g} kr - kontrollera.")
+                else:
+                    if from_isk(x):
+                        isk_missing = True
+                        warn(f"{s.name} {d}: {x.qty:g} st flyttade från ISK ('{x.text}') - "
+                             "omkostnadsbeloppet är marknadsvärdet på överföringsdagen, ange det "
+                             "i kostnadsfilen.")
+                    continue
+                rest -= x.qty
         if rest > TOL:
             events.append(Event(d, "Övr", rest, 0.0, note=prefix + ", omkostnadsbelopp saknas (0 kr)"))
             if rows:
                 warn(f"{s.name} {d}: inlägg {qty:g} st men kostnadsfilen har {got:g} st - "
                      f"{rest:g} st tas med till 0 kr.")
-            else:
+            elif not isk_missing:
                 missing_dates.append(d)
         elif got - qty > TOL:
             warn(f"{s.name} {d}: kostnadsfilen har {got:g} st men inlägget är {qty:g} st.")
@@ -496,6 +556,10 @@ def deposit_events(s: Security, costs: list[CostRow], have_file: bool) -> list[E
     return events
 
 
+def from_isk(dp: Deposit) -> bool:
+    return bool(re.search(r"\bISK\b", dp.text.upper()))
+
+
 def write_template(path: str, securities: list[Security]) -> None:
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f, delimiter=";")
@@ -504,10 +568,12 @@ def write_template(path: str, securities: list[Security]) -> None:
             if s.opening > TOL:
                 w.writerow([s.name, s.start_date - dt.timedelta(days=1), fmt_plain(s.opening), "",
                             "Köp", "Ingående innehav före Nordnet-exporten"])
-            for dp in sorted((x for x in s.deposits if not x.internal), key=lambda x: x.date):
+            for dp in sorted((x for x in s.deposits if not x.internal and not x.right),
+                             key=lambda x: x.date):
                 cost = "" if dp.nordnet_cost is None else fmt_plain(dp.nordnet_cost)
+                note = "Marknadsvärde på överföringsdagen (från ISK)" if from_isk(dp) else ""
                 w.writerow([s.name, dp.date, fmt_plain(dp.qty), cost,
-                            "Köp" if dp.nordnet_cost is None else "Övr", ""])
+                            "Köp" if dp.nordnet_cost is None else "Övr", note])
 
 
 # --------------------------------------------------------------------------- calculation
@@ -518,19 +584,33 @@ def compute(events: list[Event], name: str):
     total_qty = 0.0
     total_cost = 0.0
     for e in sorted(events, key=lambda e: (e.date, e.order)):
-        if e.kind == "S":
+        kind, note = e.kind, e.note
+        if kind == "S":
             delta_q, change = total_qty * (e.ratio - 1), 0.0
-        elif e.kind in ("Förs", "Ut"):
+        elif kind in ("Förs", "Ut", "Inl"):
             if e.qty > total_qty + TOL:
-                warn(f"{name} {e.date}: {'försäljning' if e.kind == 'Förs' else 'uttag'} av "
+                warn(f"{name} {e.date}: {'uttag' if kind == 'Ut' else 'försäljning'} av "
                      f"{e.qty:g} st men endast {total_qty:g} st i beräkningen - historiken är "
                      "ofullständig.")
             avg_before = total_cost / total_qty if total_qty else 0.0
             delta_q, change = -e.qty, -e.qty * avg_before + 0.0  # avoid -0.0
-            if e.kind == "Förs":
+            if kind == "Inl":
+                if abs(e.proceeds) < 0.005 and abs(change) < 0.005:
+                    kind, note = "Ut", note + ", utan ersättning och utan omkostnadsbelopp"
+                else:
+                    kind = "Förs"
+                    if abs(e.proceeds) < 0.005:
+                        warn(f"{name} {e.date}: inlösen/förfall av {e.qty:g} st utan belopp "
+                             "redovisas som försäljning för 0 kr - kontrollera om likvid "
+                             "bokats på en egen rad.")
+            if kind == "Förs":
                 sales.append({"Datum": e.date.isoformat(), "Antal": e.qty, "Beteckning": name,
                               "Försäljningspris": e.proceeds, "Omkostnadsbelopp": 0.0 - change,
                               "Resultat": e.proceeds + change, "Nota": e.ref})
+                if e.nordnet_result is not None and \
+                        abs(e.nordnet_result - sales[-1]["Resultat"]) > 1:
+                    warn(f"{name} {e.date}: resultat {sales[-1]['Resultat']:.2f} kr men "
+                         f"{e.nordnet_result:.2f} kr enligt Nordnet.")
         else:
             delta_q, change = e.qty, e.cost
         total_qty += delta_q
@@ -541,13 +621,13 @@ def compute(events: list[Event], name: str):
         rows.append({
             "Beteckning": name,
             "Datum": e.date.isoformat(),
-            "Händelse": "Övr" if e.kind == "Ut" else e.kind,
+            "Händelse": "Övr" if kind == "Ut" else kind,
             "Antal +/-": delta_q,
             "Totalt antal": total_qty,
             "Inköpspris (+) / utnyttjat omk.belopp (-), kr": change,
             "Totalt outnyttjat omk.belopp, kr": total_cost,
             "Genomsnittligt omk.belopp, kr": avg,
-            "Kommentar": e.note,
+            "Kommentar": note,
         })
     return rows, sales
 
